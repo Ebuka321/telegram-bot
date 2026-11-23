@@ -10,7 +10,9 @@ import {
   Logger,
   parseLogFormat,
   parseLogLevel,
+  redactLine,
 } from "../dist/logger.js";
+import { stripTerminalEscapes } from "../dist/redact.js";
 
 /** Collect rendered lines instead of writing to the process's own streams. */
 function captureConsole() {
@@ -215,3 +217,123 @@ test("reset restores the defaults and drops registered secrets", () => {
   // Text default, and the shape regex still catches it.
   assert.equal(lines[0].line, "[REDACTED]");
 });
+
+test("unsupported types and circular references are replaced with bounded sentinels", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+
+  const circularObj = { name: "parent" };
+  circularObj.child = { parent: circularObj };
+
+  const circularArr = ["first"];
+  circularArr.push(circularArr);
+
+  Logger.warn("poller", "cycle_details", {
+    circularObj,
+    circularArr,
+    sym: Symbol("debug-symbol"),
+    fnArr: [() => "ignored"],
+    fn: () => "ignored",
+  });
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].level, "warn");
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.level, "warn");
+  assert.equal(record.component, "poller");
+  assert.equal(record.msg, "cycle_details");
+  assert.equal(record.circularObj.name, "parent");
+  assert.equal(record.circularObj.child.parent.child.parent, "[depth-limit]");
+  assert.equal(record.circularArr[0], "first");
+  assert.equal(record.circularArr[1][1][1][1], "[depth-limit]");
+  assert.equal(record.sym, "[unsupported:symbol]");
+  assert.equal(record.fnArr[0], "[unsupported:function]");
+});
+
+test("serialization failure preserves event level and stable message", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+
+  const poisoned = {};
+  Object.defineProperty(poisoned, "blowup", {
+    enumerable: true,
+    get() {
+      throw new Error("unexpected serialization crash");
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    Logger.error("poller", "polling failed due to transient network error", {
+      detail: poisoned,
+    });
+  });
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].level, "error");
+  assert.equal(lines[0].line, "polling failed due to transient network error");
+});
+
+test("throwing log sink does not terminate caller", () => {
+  Logger.configure({
+    format: "json",
+    sink: () => {
+      throw new Error("sink stream write error");
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    Logger.info("poller", "cycle_complete", { cycle: 1 });
+  });
+});
+
+test("text mode strips ANSI/CSI and OSC terminal escape sequences", () => {
+  Logger.configure({ format: "text" });
+  const lines = captureConsole();
+
+  Logger.warn(
+    "poller",
+    "market \x1b[31mERROR\x1b[0m \x1b]0;spoofed-title\x07 \x1b]8;;https://evil.example\x1b\\click\x1b]8;;\x1b\\",
+  );
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].line, "market ERROR  click");
+  assert.equal(/\x1b|\x07/.test(lines[0].line), false);
+});
+
+test("json mode strips ANSI/OSC sequences from untrusted fields as well as message", () => {
+  Logger.configure({ format: "json" });
+  const lines = captureConsole();
+
+  Logger.error("poller", "failed \x1b[2J\x1b[H", {
+    reason: "\x1b]52;c;SGVsbG8=\x07bad\x1b[31m payload\x1b[0m",
+    nested: { label: "\x9b31mred\x9b0m" },
+  });
+
+  const record = JSON.parse(lines[0].line);
+  assert.equal(record.msg, "failed ");
+  assert.equal(record.reason, "bad payload");
+  assert.equal(record.nested.label, "red");
+});
+
+test("terminal escape neutralization preserves ordinary Unicode content and whitespace", () => {
+  Logger.configure({ format: "text" });
+  const lines = captureConsole();
+
+  const unicodeMsg = "Market: café 🚀 👨‍👩‍👧‍👦 市場 هل ستفوز · …\n\tsecond line";
+  Logger.info("poller", unicodeMsg);
+
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].line, unicodeMsg);
+});
+
+test("boundary: unterminated OSC, truncated CSI, bare ESC, and CR overwrite are neutralized", () => {
+  assert.equal(stripTerminalEscapes(""), "");
+  assert.equal(stripTerminalEscapes("prefix \x1b]0;unterminated-title"), "prefix ");
+  assert.equal(stripTerminalEscapes("prefix \x1b[31"), "prefix ");
+  assert.equal(stripTerminalEscapes("ok\x1b"), "ok");
+  assert.equal(stripTerminalEscapes("real\rFAKE"), "realFAKE");
+  assert.equal(stripTerminalEscapes("\x1bcreset"), "reset");
+  assert.equal(redactLine("log \x1b[31mred\x1b[0m \x1b]0;t\x07", []), "log red ");
+});
+
+
